@@ -434,6 +434,25 @@ public abstract class AbstractRegistry implements Registry {
         }
     }
 
+    /**
+     * 【中等】过滤空列表，返回empty协议URL
+     * 
+     * 设计背景：当某个服务的所有Provider都下线时，注册中心会返回空列表。
+     * 但Dubbo需要明确区分"服务不存在"和"所有Provider已下线"两种情况。
+     * 
+     * 处理策略：
+     * - 空列表 -> 返回包含empty协议的单元素列表
+     * - 非空列表 -> 直接返回原列表
+     * 
+     * empty协议作用：
+     * - 告诉Consumer该服务存在但暂无Provider
+     * - Consumer可以保留引用，等待Provider上线
+     * - 区别于服务不存在（返回null）
+     * 
+     * @param url 原始订阅URL（用于构造empty协议URL）
+     * @param urls Provider列表（可能为空）
+     * @return 处理后的URL列表（至少包含一个元素）
+     */
     protected static List<URL> filterEmpty(URL url, List<URL> urls) {
         if (CollectionUtils.isEmpty(urls)) {
             List<URL> result = new ArrayList<>(1);
@@ -443,11 +462,20 @@ public abstract class AbstractRegistry implements Registry {
         return urls;
     }
 
+    /**
+     * 【易懂】获取注册中心URL
+     * @return 注册中心URL（如zookeeper://127.0.0.1:2181/...）
+     */
     @Override
     public URL getUrl() {
         return registryUrl;
     }
 
+    /**
+     * 【易懂】设置注册中心URL（带参数校验）
+     * @param url 注册中心URL
+     * @throws IllegalArgumentException 如果url为null
+     */
     protected void setUrl(URL url) {
         if (url == null) {
             throw new IllegalArgumentException("registry url == null");
@@ -455,47 +483,254 @@ public abstract class AbstractRegistry implements Registry {
         this.registryUrl = url;
     }
 
+    /**
+     * 【中等】获取已注册URL集合（只读视图）
+     * 
+     * 用途：
+     * - 查询当前应用注册了哪些服务
+     * - 用于重连后恢复注册（recover方法）
+     * - 监控和诊断工具
+     * 
+     * @return 不可修改的已注册URL集合
+     */
     public Set<URL> getRegistered() {
         return Collections.unmodifiableSet(registered);
     }
 
+    /**
+     * 【中等】获取订阅关系映射（只读视图）
+     * 
+     * 结构：URL（订阅条件） -> Set<NotifyListener>（监听器集合）
+     * 
+     * 用途：
+     * - 查询当前应用订阅了哪些服务
+     * - 用于重连后恢复订阅（recover方法）
+     * - 诊断订阅关系
+     * 
+     * @return 不可修改的订阅关系映射
+     */
     public Map<URL, Set<NotifyListener>> getSubscribed() {
         return Collections.unmodifiableMap(subscribed);
     }
 
+    /**
+     * 【关键】获取通知数据缓存（只读视图）
+     * 
+     * 三层结构：URL（订阅条件） -> Category（分类） -> List<URL>（Provider列表）
+     * 
+     * 用途：
+     * - 快速查询最新的Provider列表
+     * - 注册中心宕机时使用缓存数据
+     * - lookup()方法从此获取数据
+     * 
+     * @return 不可修改的通知数据缓存
+     */
     public Map<URL, Map<String, List<URL>>> getNotified() {
         return Collections.unmodifiableMap(notified);
     }
 
+    /**
+     * 【易懂】获取本地缓存文件对象
+     * @return 缓存文件（可能为null如果禁用了本地缓存）
+     */
     public File getCacheFile() {
         return file;
     }
 
+    /**
+     * 【易懂】获取Properties缓存对象
+     * @return 内存中的Properties缓存
+     */
     public Properties getCacheProperties() {
         return properties;
     }
 
+    /**
+     * 【中等】获取缓存版本号（用于并发控制）
+     * @return 当前缓存版本号
+     */
     public AtomicLong getLastCacheChanged() {
         return lastCacheChanged;
     }
 
+    /**
+     * 【困难】执行文件保存操作（核心持久化逻辑）
+     * 
+     * ═══════════════════════════════════════════════════════════════════════
+     * 核心职责：将内存中的Properties缓存写入本地文件，使用文件锁避免多进程冲突
+     * ═══════════════════════════════════════════════════════════════════════
+     * 
+     * 【困难】版本控制机制（防止覆盖最新数据）：
+     * 
+     * 问题场景：
+     * 1. 线程A触发保存，version=100，延迟500ms执行
+     * 2. 线程B收到新通知，version=101，也延迟500ms执行
+     * 3. 如果A后执行，会用旧数据覆盖B的新数据
+     * 
+     * 解决方案：
+     * - 每次修改properties时版本号+1（lastCacheChanged.incrementAndGet()）
+     * - 执行保存前检查version < lastCacheChanged.get()
+     * - 如果版本过期，放弃本次保存（已有更新的版本在队列中）
+     * 
+     * 版本比较逻辑：
+     * <pre>
+     * if (version < lastCacheChanged.get()) {
+     *     return;  // 当前版本已过期，不保存
+     * }
+     * </pre>
+     * 
+     * 【困难】文件锁机制（解决多进程并发写入）：
+     * 
+     * 问题：同一台机器多个Dubbo进程可能共享同一个缓存文件
+     * 示例：两个应用都配置了相同的file参数
+     * 
+     * 文件锁策略：
+     * 1. 创建.lock锁文件（缓存文件路径 + ".lock"）
+     * 2. 使用FileLock.tryLock()尝试获取独占锁
+     * 3. 获取成功：执行写入，释放锁，删除.lock文件
+     * 4. 获取失败：抛出IOException，触发重试机制
+     * 
+     * 锁类型：
+     * - 独占锁（排他锁）：同一时刻只有一个进程能写入
+     * - 非阻塞：tryLock()立即返回，不等待
+     * 
+     * 锁文件生命周期：
+     * <pre>
+     * 创建.lock文件 
+     *   ↓
+     * 获取FileLock
+     *   ↓
+     * 执行文件写入
+     *   ↓
+     * 释放FileLock（自动，try-with-resources）
+     *   ↓
+     * 删除.lock文件（finally块）
+     * </pre>
+     * 
+     * 【困难】并发写入优化（深拷贝vs直接引用）：
+     * 
+     * 同步模式（syncSaveFile=true）：
+     * - 保存线程 = 修改线程（都在registryCacheExecutor）
+     * - 直接使用properties引用，无需拷贝
+     * - 性能最优，但可能阻塞其他操作
+     * 
+     * 异步模式（syncSaveFile=false，默认）：
+     * - 保存线程 ≠ 修改线程（notify可能在任意线程）
+     * - 深拷贝properties到tmpProperties避免并发修改
+     * - 性能稍差，但不会阻塞业务线程
+     * 
+     * 为什么需要深拷贝：
+     * <pre>
+     * 线程A：properties.setProperty("key", "value")  // 正在修改
+     * 线程B：properties.store(outputStream)          // 正在保存
+     * 问题：Properties内部使用Hashtable，setProperty和store都需要锁
+     *      如果并发调用会产生锁竞争，影响性能
+     * 解决：拷贝一份独立的Properties，保存操作不影响主对象
+     * </pre>
+     * 
+     * 【中等】重试机制：
+     * 
+     * 失败场景：
+     * 1. 文件锁被其他进程占用（OverlappingFileLockException）
+     * 2. 磁盘空间不足
+     * 3. 权限不足
+     * 
+     * 重试策略：
+     * - 最大重试次数：MAX_RETRY_TIMES_SAVE_PROPERTIES（3次）
+     * - 重试间隔：DEFAULT_INTERVAL_SAVE_PROPERTIES（500ms）
+     * - 达到上限后记录错误日志并停止重试
+     * 
+     * 【中等】性能分析：
+     * 
+     * 时间复杂度：O(N) - N为properties中的键值对数量（深拷贝）
+     * 空间复杂度：O(N) - 异步模式需要深拷贝
+     * IO开销：单次文件写入，通常<10ms（取决于数据量）
+     * 锁竞争：tryLock非阻塞，冲突时立即返回
+     * 
+     * 瓶颈：
+     * - 大量服务订阅导致properties数据量大
+     * - 磁盘IO速度（机械硬盘 vs SSD）
+     * - 多进程频繁写入导致锁竞争
+     * 
+     * 【关键】典型使用场景：
+     * 
+     * 场景1：异步延迟保存（默认行为）
+     * <pre>
+     * notify收到Provider变更
+     *   ↓
+     * saveProperties()更新properties并触发保存
+     *   ↓
+     * registryCacheExecutor.schedule(() -> doSaveProperties(version), 500ms)
+     *   ↓
+     * 500ms后执行doSaveProperties()
+     * </pre>
+     * 
+     * 场景2：同步立即保存（syncSaveFile=true）
+     * <pre>
+     * notify收到Provider变更
+     *   ↓
+     * saveProperties()更新properties
+     *   ↓
+     * doSaveProperties(version)立即执行（阻塞当前线程）
+     * </pre>
+     * 
+     * 场景3：多进程文件锁冲突
+     * <pre>
+     * 进程A正在写入文件（持有锁）
+     *   ↓
+     * 进程B尝试写入：tryLock()返回null
+     *   ↓
+     * 抛出IOException触发重试
+     *   ↓
+     * 500ms后重新尝试
+     * </pre>
+     * 
+     * 【关键】前置条件：
+     * - file不为null（本地缓存已启用）
+     * - version >= lastCacheChanged.get()（版本未过期）
+     * - 有文件写入权限
+     * 
+     * 【关键】后置条件：
+     * - properties数据已持久化到文件
+     * - .lock锁文件已删除
+     * - 重试计数器已重置（成功时）
+     * 
+     * 【关键】可见副作用：
+     * - 文件系统：写入缓存文件，创建并删除.lock文件
+     * - 内存：异步模式会临时创建Properties副本
+     * - 日志：失败时记录warn/error日志
+     * - 重试任务：失败时调度延迟重试任务
+     * 
+     * @param version 要保存的数据版本号（用于乐观锁校验）
+     */
     public void doSaveProperties(long version) {
+        // 【困难】版本检查：如果当前版本已过期，放弃保存
+        // 原因：已有更新的版本在队列中等待保存，无需保存旧数据
         if (version < lastCacheChanged.get()) {
             return;
         }
+        
+        // 【易懂】缓存未启用，直接返回
         if (file == null) {
             return;
         }
-        // Save
+        
+        // 【中等】锁文件对象，用于finally块中删除
         File lockfile = null;
         try {
+            // 【困难】创建锁文件（缓存文件路径 + ".lock"）
+            // 示例：~/.dubbo/dubbo-registry-app-127.0.0.1-2181.cache.lock
             lockfile = new File(file.getAbsolutePath() + ".lock");
             if (!lockfile.exists()) {
                 lockfile.createNewFile();
             }
 
+            // 【困难】使用try-with-resources自动释放文件锁和通道
             try (RandomAccessFile raf = new RandomAccessFile(lockfile, "rw");
                     FileChannel channel = raf.getChannel()) {
+                
+                // 【关键】尝试获取独占文件锁（非阻塞）
+                // 返回null表示锁被其他进程持有
                 FileLock lock = channel.tryLock();
                 if (lock == null) {
 
@@ -503,7 +738,7 @@ public abstract class AbstractRegistry implements Registry {
                             "Can not lock the registry cache file " + file.getAbsolutePath() + ", "
                                     + "ignore and retry later, maybe multi java process use the file, please config: dubbo.registry.file=xxx.properties");
 
-                    // 1-9 failed to read / save registry cache file.
+                    // 【易懂】记录警告日志（错误码1-9：缓存文件读写失败）
                     logger.warn(
                             REGISTRY_FAILED_READ_WRITE_CACHE_FILE,
                             CAUSE_MULTI_DUBBO_USING_SAME_FILE,
@@ -514,20 +749,24 @@ public abstract class AbstractRegistry implements Registry {
                     throw ioException;
                 }
 
-                // Save
+                // 【关键】获取锁成功，开始写入文件
                 try {
+                    // 【易懂】确保缓存文件存在
                     if (!file.exists()) {
                         file.createNewFile();
                     }
 
+                    // 【困难】根据同步/异步模式选择不同的数据源
                     Properties tmpProperties;
                     if (syncSaveFile) {
-                        // When syncReport = true, properties.setProperty and properties.store are called from the same
-                        // thread(reportCacheExecutor), so deep copy is not required
+                        // 【中等】同步模式：直接使用properties引用
+                        // 原因：properties.setProperty和store在同一线程（registryCacheExecutor）
+                        //      不存在并发修改问题，无需深拷贝
                         tmpProperties = properties;
                     } else {
-                        // Using properties.setProperty and properties.store method will cause lock contention
-                        // under multi-threading, so deep copy a new container
+                        // 【困难】异步模式：深拷贝properties避免并发修改
+                        // 原因：properties可能在其他线程被修改（notify调用）
+                        //      直接使用会导致ConcurrentModificationException或锁竞争
                         tmpProperties = new Properties();
                         Set<Map.Entry<Object, Object>> entries = properties.entrySet();
                         for (Map.Entry<Object, Object> entry : entries) {

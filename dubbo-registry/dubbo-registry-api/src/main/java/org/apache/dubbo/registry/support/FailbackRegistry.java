@@ -44,27 +44,194 @@ import static org.apache.dubbo.registry.Constants.DEFAULT_REGISTRY_RETRY_PERIOD;
 import static org.apache.dubbo.registry.Constants.REGISTRY_RETRY_PERIOD_KEY;
 
 /**
- * A template implementation of registry service that provides auto-retry ability.
+ * ============================================================================
+ * 文件概述：提供自动失败重试能力的注册中心抽象模板类
+ * ============================================================================
+ * 
+ * 本文件在AbstractRegistry基础上增加了失败自动重试机制，是Zookeeper、Nacos等
+ * 注册中心实现的直接父类。当注册/订阅操作失败时（网络故障、注册中心暂时不可用），
+ * 会自动在后台定时重试，直到成功为止，大大提升了系统的容错能力。
+ * 
+ * 【关键】核心设计理念：
+ * 
+ * 1. 失败重试vs立即失败：
+ *    立即失败（AbstractRegistry）：操作失败立即抛异常（check=true时）
+ *    失败重试（FailbackRegistry）：操作失败记录任务，后台定时重试
+ *    设计哲学："网络故障是暂时的，重试能解决大多数问题"
+ * 
+ * 2. 四种失败任务独立管理：
+ *    - FailedRegisteredTask：注册失败任务
+ *    - FailedUnregisteredTask：注销失败任务
+ *    - FailedSubscribedTask：订阅失败任务
+ *    - FailedUnsubscribedTask：取消订阅失败任务
+ *    原因：不同操作的重试逻辑可能不同，独立管理更灵活
+ * 
+ * 3. 时间轮定时器（HashedWheelTimer）：
+ *    - 高效：O(1)时间复杂度添加/删除任务
+ *    - 精度：毫秒级定时精度
+ *    - 内存：128个时间槽，适合中等数量的任务
+ *    - 对比：相比JDK的ScheduledExecutorService，内存和CPU开销更小
+ * 
+ * 【困难】重试机制详解：
+ * 
+ * 重试流程（以注册为例）：
+ * <pre>
+ * register(url)调用失败
+ *   ↓
+ * addFailedRegistered(url)创建重试任务
+ *   ↓
+ * retryTimer.newTimeout(task, 5秒)调度任务
+ *   ↓
+ * 5秒后执行task.run() -> doRegister(url)
+ *   ↓
+ * 成功：从failedRegistered移除任务
+ * 失败：再次调度5秒后重试（无限循环）
+ * </pre>
+ * 
+ * 任务去重策略：
+ * - 同一个URL只能有一个重试任务
+ * - 使用putIfAbsent保证并发安全
+ * - 重复添加会被忽略（避免重复重试）
+ * 
+ * 任务取消条件：
+ * - 手动调用成功（如register成功）
+ * - 调用反向操作（如先register失败，后调用unregister）
+ * - Registry销毁
+ * 
+ * 【中等】时间轮参数说明：
+ * 
+ * retryPeriod（重试周期）：
+ * - 默认值：5000ms（5秒）
+ * - 配置：registry.retry.period参数
+ * - 建议：不要设置太小（避免过度重试给注册中心压力）
+ * 
+ * ticksPerWheel（时间槽数量）：
+ * - 固定值：128
+ * - 含义：时间轮被分为128个槽
+ * - 精度：tickDuration = retryPeriod / 128
+ * - 权衡：槽数越多精度越高，但内存占用越大
+ * 
+ * 【中等】典型使用场景：
+ * 
+ * 场景1：注册中心临时故障
+ * <pre>
+ * Provider启动 -> register(url)
+ *   ↓
+ * Zookeeper连接超时（网络抖动）
+ *   ↓
+ * addFailedRegistered(url)启动重试
+ *   ↓
+ * 5秒后网络恢复，重试成功
+ * </pre>
+ * 
+ * 场景2：注册中心宕机
+ * <pre>
+ * Provider启动 -> register(url)
+ *   ↓
+ * Zookeeper不可用
+ *   ↓
+ * 后台持续重试（每5秒一次）
+ *   ↓
+ * Zookeeper恢复后自动注册成功
+ * </pre>
+ * 
+ * 场景3：订阅重试
+ * <pre>
+ * Consumer启动 -> subscribe(url, listener)
+ *   ↓
+ * 订阅失败（注册中心压力大）
+ *   ↓
+ * 后台重试 -> 最终订阅成功 -> 收到Provider列表
+ * </pre>
+ * 
+ * 【关键】与AbstractRegistry的协作：
+ * 
+ * AbstractRegistry职责：
+ * - 本地缓存管理
+ * - 文件持久化
+ * - 通知分发
+ * 
+ * FailbackRegistry职责：
+ * - 失败重试
+ * - 重试任务管理
+ * - 定时器调度
+ * 
+ * 子类（如ZookeeperRegistry）职责：
+ * - 实现doRegister/doUnregister/doSubscribe/doUnsubscribe
+ * - 与具体注册中心交互
+ * 
+ * 【中等】性能和资源消耗：
+ * 
+ * 内存开销：
+ * - 每个失败任务：~200字节（Task对象 + URL + Listener）
+ * - HashedWheelTimer：~10KB（128个槽）
+ * - 正常情况下失败任务很少，内存影响可忽略
+ * 
+ * CPU开销：
+ * - 时间轮运转：恒定开销，与任务数量无关
+ * - 重试执行：取决于网络IO（连接注册中心）
+ * 
  * (SPI, Prototype, ThreadSafe)
  */
 public abstract class FailbackRegistry extends AbstractRegistry {
 
-    /*  retry task map */
+    // ===== 失败重试任务映射（四种独立的任务类型） =====
 
+    /**
+     * 【关键】注册失败任务映射
+     * 结构：URL -> FailedRegisteredTask
+     * 场景：register(url)失败时添加，成功后移除
+     * 去重：同一URL只保留一个任务
+     */
     private final ConcurrentMap<URL, FailedRegisteredTask> failedRegistered = new ConcurrentHashMap<>();
 
+    /**
+     * 【关键】注销失败任务映射
+     * 结构：URL -> FailedUnregisteredTask
+     * 场景：unregister(url)失败时添加
+     * 特殊处理：如果URL有注册失败任务，会先取消注册任务
+     */
     private final ConcurrentMap<URL, FailedUnregisteredTask> failedUnregistered = new ConcurrentHashMap<>();
 
+    /**
+     * 【关键】订阅失败任务映射
+     * 结构：Holder(URL, Listener) -> FailedSubscribedTask
+     * 场景：subscribe(url, listener)失败时添加
+     * 键设计：使用Holder包装URL和Listener，因为同一URL可能有多个Listener
+     */
     private final ConcurrentMap<Holder, FailedSubscribedTask> failedSubscribed = new ConcurrentHashMap<>();
 
+    /**
+     * 【关键】取消订阅失败任务映射
+     * 结构：Holder(URL, Listener) -> FailedUnsubscribedTask
+     * 场景：unsubscribe(url, listener)失败时添加
+     */
     private final ConcurrentMap<Holder, FailedUnsubscribedTask> failedUnsubscribed = new ConcurrentHashMap<>();
 
     /**
-     * The time in milliseconds the retryExecutor will wait
+     * 【中等】重试周期（毫秒）
+     * 默认值：5000ms（5秒）
+     * 配置项：registry.retry.period
      */
     private final int retryPeriod;
 
-    // Timer for failure retry, regular check if there is a request for failure, and if there is, an unlimited retry
+    /**
+     * 【困难】时间轮定时器：用于调度重试任务
+     * 
+     * 工作原理：
+     * 1. 时间轮分为128个槽（ticksPerWheel=128）
+     * 2. 指针每隔tickDuration移动一格
+     * 3. 任务添加到对应槽位，指针扫到时执行
+     * 
+     * 性能特点：
+     * - 添加任务：O(1)
+     * - 删除任务：O(1)
+     * - 执行任务：O(1)（每个槽位的任务数量很少）
+     * 
+     * 线程模型：
+     * - 单线程执行任务（DubboRegistryRetryTimer线程）
+     * - 守护线程：JVM退出时自动停止
+     */
     private final HashedWheelTimer retryTimer;
 
     public FailbackRegistry(URL url) {
